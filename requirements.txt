@@ -1,0 +1,8 @@
+tiktoken
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.0.0+cu118
+torchaudio==2.0.0+cu118
+torchvision==0.15.0+cu118
+tqdm
+transformers
+wandb
