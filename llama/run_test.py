@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+llama_weights_7b_base = "/llama_weights/7B_hf/"
+llama_weights_7b_tuned = "/llama-redpajama-mem-15000-with-mem/"
+cache_path = "/hf-cache/"
+
 def make_llama_base_pipe():
 
     from transformers import pipeline
@@ -19,8 +23,8 @@ def make_llama_base_pipe():
     from transformers.models.llama import LlamaForCausalLM
 
     llama_base = LlamaForCausalLM.from_pretrained(
-        "/llama_weights/7B_hf/",
-        cache_dir="/hf-cache/",
+        llama_weights_7b_base,
+        cache_dir=cache_path,
     )
 
     llama_base = llama_base.to('cuda:0')
@@ -28,8 +32,8 @@ def make_llama_base_pipe():
     import transformers
     
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        "/llama_weights/7B_hf/",
-        cache_dir="/hf-cache/",
+        llama_weights_7b_base,
+        cache_dir=cache_path,
         model_max_length=1024,
         padding_side="right",
         use_fast=False,
@@ -43,11 +47,11 @@ def make_llama_base_pipe():
 llama_base_pipe = make_llama_base_pipe()
 
 def make_llama_mem_pipe():
-    from stanford_alpaca.llama_mem import LlamaForCausalLM
+    from llama_mem import LlamaForCausalLM
 
     model = LlamaForCausalLM.from_pretrained(
-        "/llama-redpajama-mem-15000-with-mem/",
-        cache_dir="/hf-cache/",
+        llama_weights_7b_tuned,
+        cache_dir=cache_path,
     )
 
     model.to('cuda:1')
@@ -55,8 +59,8 @@ def make_llama_mem_pipe():
     import transformers
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-            "/llama-redpajama-mem-15000-with-mem/",
-            cache_dir="/hf-cache/",
+            llama_weights_7b_tuned,
+            cache_dir=cache_path,
             model_max_length=512,
             padding_side="right",
             use_fast=False,
@@ -66,7 +70,6 @@ def make_llama_mem_pipe():
     return llama_mem_pipe
 
 
-#
 llama_mem_pipe = make_llama_mem_pipe()
 
 mem_id = llama_mem_pipe.tokenizer.convert_tokens_to_ids("<landmark>")
@@ -81,18 +84,7 @@ import torch
 import os
 import random
 import re
-#import matplotlib.pyplot as plt
 import requests
-
-def block_shuffle(n, B):
-    # Create a list of indices divided into blocks of size B
-    blocks = [list(range(i, min(i + B, n + 1))) for i in range(1, n + 1, B)]
-    # Shuffle the blocks
-    random.shuffle(blocks)
-    # Flatten the list of blocks into a single list of indices
-    shuffled_indices = [i for block in blocks for i in block]
-
-
 
 def generate_prompt(n_garbage):
     """Generates a text file and inserts an execute line at a random position."""
@@ -120,7 +112,7 @@ def generate_prompt(n_garbage):
 
 
 def test_model(prompt_text, pass_key, model_name):
-    response = pipes[model_name](prompt_text,num_return_sequences=1, max_new_tokens=10, offload_cache_to_cpu=False)[0]["generated_text"][len(prompt_text):]
+    response = pipes[model_name](prompt_text,num_return_sequences=1, max_new_tokens=10)[0]["generated_text"][len(prompt_text):]
     assert f"The pass key is {pass_key}" in prompt_text
 
     try:
