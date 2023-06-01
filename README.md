@@ -37,9 +37,10 @@ You will need to initialize the dataset before running the training script. For 
 The code supports inference in various settings. To perform standard evaluation, disable cache and use the same chunk size (specified using `--mid_length` flag) as the evaluation length (specified by `--eval_seq_length`). Using landmarks is possible when using `mem_cache`. The script `eval_cmd_generator.py` can be used to generate a bash script containining commands to perform evaluations corresponding to Tables 1 and 2 of the paper. The path of the output models need to be updated inside the script.
 
 ## LLaMA fine-tuning
-The code for fine-tuning LLaMA and testing the final model is available as a standalone project in the sub-directory "llama".  An example for running the fine tuning is:
+The code for fine-tuning LLaMA and testing the final model is available as a standalone project in the sub-directory "llama".  An example for running the fine tuning (from inside the sub-directory) is:
 
-```torchrun --nproc_per_node=8  train.py  \
+```
+torchrun --nproc_per_node=8  train.py  \
     --model_name_or_path /llama_weights/7B_hf/ \
     --bf16 True \
     --output_dir /llama-redpajama-mem-15000-with-mem/  \
