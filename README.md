@@ -66,5 +66,12 @@ torchrun --nproc_per_node=8  train.py  \
 
 In the above example, LLaMA wieghts (converted to huggingface format) should be in `/llama_weights/7B_hf/`.
 
+### Fine-tuned Weights
+We have released the weight diff between the original LLaMA 7B and the same model fine-tuned for 15000 steps on [RedPajama](https://github.com/togethercomputer/RedPajama-Data) dataset with landmark attention [here](https://huggingface.co/epfml/landmark-attention-llama7b-wdiff). You may use the `weight_diff.py` script to recover the weights:
+```
+python weight_diff.py recover --path_raw <path_to_original_llama7b_weights> --path_diff <path_to_weight_diff> --path_tuned <path_to_store_recovered_weights>
+```
+For an example of how to perform inference using landmarks, look at `run_test.py`.
+
 ## Naming
 During the development of this project, we made the decision to update the names of certain components. However, as this decision was made later in the project timeline, you may encounter references to the old names within the code (e.g. `mem` instead of `landmark`). We are working to address this issue.
