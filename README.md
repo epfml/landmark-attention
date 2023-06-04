@@ -64,7 +64,7 @@ torchrun --nproc_per_node=8  train.py  \
     --max_steps 15000
 ```
 
-In the above example, LLaMA wieghts (converted to huggingface format) should be in `/llama_weights/7B_hf/`.
+In the above example, LLaMA wieghts (converted to Hugging Face format) should be in `/llama_weights/7B_hf/`.
 
 ### Fine-tuned Weights
 We have released the weight diff between the original LLaMA 7B and the same model fine-tuned for 15000 steps on [RedPajama](https://github.com/togethercomputer/RedPajama-Data) dataset with landmark attention [here](https://huggingface.co/epfml/landmark-attention-llama7b-wdiff). You may use the `weight_diff.py` script to recover the weights:
