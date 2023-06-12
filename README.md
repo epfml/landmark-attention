@@ -88,12 +88,18 @@ For an example of how to perform inference using landmarks, look at `run_test.py
 
 ### Triton Implementation
 
-We have added a Triton implementation of the combination of our method and Flash Attention which significantly reduces memory usage and also increases performance. Using this implementation, we trained LLaMA 7B with 2048 context length (instead of 512).
+We have added a Triton implementation of the combination of our method and Flash Attention which significantly reduces memory usage and also increases performance. Using this implementation, we trained LLaMA 7B with 2048 context length (instead of 512). Also, adding landmark attention to any model can be done by applying the following changes: 
 
-The current implementation makes the following assumptions:
+1. Adding landmark tokens to the input at regular intervals of block size.
+2. (Optional) Creating a boolean mask of which tokens are landmarks. The mask can be passed to the landmark attention function to ensure the landmarks are placed correctly. This step can be skipped to obtain the highest speed.
+3. Replacing `torch.nn.functional.scaled_dot_product_attention` with `fused_landmark_attention`. 
+
+Note that the implemnetation relies on the latest version of Triton which causes a conflict with latest version of PyTorch. Therefore, a special `install_deps.sh` script is provided to install the dependencies.
+
+Finally, note that the current implementation makes the following assumptions:
 
 1. The implementation assumes the landmark blocks have the same size as blocks used for computing the attention in Flash Attention. This limits the maximum size of the block as the whole landmark block should fit into GPU's local memory. However, using bfloat16 it should be possible to use block sizes as large as 64 or 128 which should be enough for landmark blocks.
 2. The implementation assumes the difference between number of keys and queries is a multiple of the block size. Therefore, normal attention must be applied in the auto-regressive part of the generation when the tokens are generated one by one. The implemnetation can still be used to go over the input before reaching the generation. 
 Note that this is not a big limitation since when generating tokens one by one, the attention matrix has only a single row, limiting the benefits of Flash Attention. 
-
-Also, note that the implemnetation relies on the latest version of Triton which causes a conflict with latest version of PyTorch. Therefore, a special `install_deps.sh` script is provided to install the dependencies.
+3. While the high level implementation allows the landmark tokens to be placed anywhere, the fused implementation assumes the landmark tokens are placed regularly at the end of each block. Since we always use this pattern at inference, this should not be noticed.
+ 
