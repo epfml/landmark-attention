@@ -49,6 +49,8 @@ class TrainingArguments(transformers.TrainingArguments):
         default=512,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
+    use_flash: bool = field(default=False)
+    mem_freq: int = field(default=63)
 
     
 class TrainerCosine(Trainer):
@@ -105,18 +107,6 @@ def tokenize_fn(tokenizer, example):
     )
     return {"input_ids": outputs["input_ids"].view(-1, context_length)}
 
-def add_mem_tokens(example, mem_freq, mem_id):
-    x = example["input_ids"]
-    ret = []
-    prev_idx = 0
-    for t_idx in range(mem_freq, len(x), mem_freq):
-        ret.extend(x[prev_idx:t_idx])
-        ret.append(mem_id)
-        prev_idx = t_idx
-    ret.extend(x[prev_idx:])
-    # drop attention_mask
-    return {"input_ids": ret}
-
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses()
@@ -124,6 +114,7 @@ def train():
     model = LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
+        mem_freq=training_args.mem_freq,
     )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -153,6 +144,7 @@ def train():
 
     mem_id = tokenizer.convert_tokens_to_ids(mem_token)
     model.set_mem_id(mem_id)
+    
     rank = int(os.environ.get('RANK', -1))
     if rank > 0:
         barrier()
@@ -160,12 +152,17 @@ def train():
 
     dataset = dataset.map(partial(tokenize_fn,tokenizer),batched=True, num_proc=32, remove_columns=["text", "meta"])
 
-    dataset = dataset.map(
-        partial(
-            add_mem_tokens, 
-            mem_freq=50, 
-            mem_id=mem_id
-        ), batched=False, num_proc=32)
+    if training_args.use_flash:
+        model.enable_landmark_insertion()
+        model.enable_flash()
+    else:
+        dataset = dataset.map(
+            partial(
+                add_mem_tokens, 
+                mem_freq=training_args.mem_freq, 
+                mem_id=mem_id
+            ), batched=False, num_proc=32)
+
     if rank == 0:
         barrier()
     print(dataset)

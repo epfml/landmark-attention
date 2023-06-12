@@ -12,9 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
+
+import os
+import random
+import re
+import requests
+
+
 llama_weights_7b_base = "/llama_weights/7B_hf/"
 llama_weights_7b_tuned = "/llama-redpajama-mem-15000-with-mem/"
 cache_path = "/hf-cache/"
+use_flash = False # using flash for inference is only implemented for when offloading kv to cpu
+top_k = 5
+dtype = torch.bfloat16
 
 def make_llama_base_pipe():
 
@@ -34,7 +45,7 @@ def make_llama_base_pipe():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         llama_weights_7b_base,
         cache_dir=cache_path,
-        model_max_length=1024,
+        model_max_length=2048,
         padding_side="right",
         use_fast=False,
     )
@@ -52,6 +63,7 @@ def make_llama_mem_pipe():
     model = LlamaForCausalLM.from_pretrained(
         llama_weights_7b_tuned,
         cache_dir=cache_path,
+        torch_dtype=dtype
     )
 
     model.to('cuda:1')
@@ -61,30 +73,25 @@ def make_llama_mem_pipe():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
             llama_weights_7b_tuned,
             cache_dir=cache_path,
-            model_max_length=512,
+            model_max_length=model.config.train_context_length,
             padding_side="right",
             use_fast=False,
         )
+    mem_id = tokenizer.convert_tokens_to_ids("<landmark>")
+    model.set_mem_id(mem_id)
     from transformers import pipeline
-    llama_mem_pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, device=model.device)
+    llama_mem_pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, device=model.device,
+                              offload_cache_to_cpu=use_flash, use_flash=use_flash, 
+                              cache_top_k=top_k)
     return llama_mem_pipe
 
 
 llama_mem_pipe = make_llama_mem_pipe()
 
-mem_id = llama_mem_pipe.tokenizer.convert_tokens_to_ids("<landmark>")
-llama_mem_pipe.model.set_mem_id(mem_id)
-llama_mem_pipe.model.set_mem_cache_args(max_seq_len=255, mem_freq=50, top_k=5, max_cache_size=None)
 
 
 pipes = {"base": llama_base_pipe, "mem": llama_mem_pipe}
 
-import torch
-
-import os
-import random
-import re
-import requests
 
 def generate_prompt(n_garbage):
     """Generates a text file and inserts an execute line at a random position."""
@@ -141,6 +148,8 @@ for n in n_values:
         
         
         for model_name in models:
+            if pipes[model_name] is None:
+                continue
             num_tokens = len(pipes[model_name].tokenizer.encode(prompt_text))
 
             print("Number of tokens in this prompt: ", num_tokens)

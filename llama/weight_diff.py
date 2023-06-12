@@ -15,6 +15,7 @@
 # This file has been changed by Amirkeivan Mohtashami
 # to take into account the new token in the embedding layer
 
+import os
 from typing import Optional
 
 import fire
@@ -22,7 +23,7 @@ import torch
 import tqdm
 import transformers
 from train import smart_tokenizer_and_embedding_resize
-
+import llama_mem
 
 @torch.inference_mode()
 def make_diff(
@@ -35,7 +36,7 @@ def make_diff(
     Run:
         python weight_diff.py make_diff --path_raw <your_path_raw> --path_tuned <your_path_tuned> --path_diff <your_path_diff>
     """
-    model_tuned: transformers.PreTrainedModel = transformers.AutoModelForCausalLM.from_pretrained(
+    model_tuned: transformers.PreTrainedModel = llama_mem.LlamaForCausalLM.from_pretrained(
         path_tuned,
         device_map={"": torch.device(device)},
         torch_dtype=torch.float32,
@@ -60,8 +61,13 @@ def make_diff(
         tokenizer=tokenizer_raw,
     )
 
+
+
     state_dict_tuned = model_tuned.state_dict()
     state_dict_raw = model_raw.state_dict()
+    with open(os.path.join(path_diff, "checksum_psum.txt"), "w") as f:
+        f.write(str(sum(state_dict_tuned[key].sum().item() for key in state_dict_tuned)))
+
     for key in tqdm.tqdm(state_dict_tuned):
         state_dict_tuned[key].add_(-state_dict_raw[key])
 
@@ -101,7 +107,7 @@ def recover(
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
     )
-    model_recovered: transformers.PreTrainedModel = transformers.AutoModelForCausalLM.from_pretrained(
+    model_recovered: transformers.PreTrainedModel = llama_mem.LlamaForCausalLM.from_pretrained(
         path_diff,
         device_map={"": torch.device(device)},
         torch_dtype=torch.float32,
@@ -128,8 +134,13 @@ def recover(
     if check_integrity_naively:
         # This is not a rigorous, cryptographically strong integrity check :)
         allsum = sum(state_dict_recovered[key].sum() for key in state_dict_recovered)
+        if os.path.exists(os.path.join(path_diff, "checksum_psum.txt")):
+            with open(os.path.join(path_diff, "checksum_psum.txt")) as f:
+                expected_sum = float(f.read())
+        else:
+            expected_sum = 49798.7656 # backward compatibility with the first released weights
         assert torch.allclose(
-            allsum, torch.full_like(allsum, fill_value=49798.7656), atol=1e-2, rtol=0
+            allsum, torch.full_like(allsum, fill_value=expected_sum), atol=1e-2, rtol=0
         ), "Naive integrity check failed. This could imply that some of the checkpoint files are corrupted."
 
     if path_tuned is not None:

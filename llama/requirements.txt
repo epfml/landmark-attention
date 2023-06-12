@@ -3,9 +3,13 @@ rouge_score
 fire
 openai
 transformers>=4.28.1
-torch
+torch>=2.0
 sentencepiece
 tokenizers>=0.13.3
 wandb
 accelerate
 datasets
+
+
+# We need Triton 2.1 but this conflicts with PyTorch 2.0 for now. Therefore the following line is commented out for now. Instead use install_deps.sh
+#git+https://github.com/openai/triton.git#subdirectory=python

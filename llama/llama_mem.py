@@ -30,12 +30,13 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
-from transformers.models.llama.configuration_llama import LlamaConfig
+from llama_landmark_config import LlamaLandmarkConfig
+from ltriton.flash_landmark_attention import fused_landmark_attention
 
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "LlamaConfig"
+_CONFIG_FOR_DOC = "LlamaLandmarkConfig"
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -134,8 +135,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    if position_ids.ndim == 2:
+        cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+        sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    else:
+        cos = cos[position_ids]
+        sin = sin[position_ids]
     if q is None:
         q_embed = None
     else:
@@ -220,7 +225,7 @@ def landmark_grouped_softmax(x, dim, is_mem, last_section_mask):
 
     full_access_mask =  is_mem | last_and_rest_mask
 
-    max_mem_cnt = 16
+    max_mem_cnt = 64
     mem_group_idx = torch.cumsum(is_mem, dim=dim)
     mem_bucket_id = max_mem_cnt - 1
     resp_mem_idx = torch.where(last_and_rest_mask, 
@@ -240,7 +245,7 @@ def landmark_grouped_softmax(x, dim, is_mem, last_section_mask):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaLandmarkConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -259,17 +264,8 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
-        self.mem_freq = None
-        self.top_k = None
-        self.max_cache_size = None
-
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
-    def set_mem_cache_args(self, mem_freq, top_k, max_cache_size):
-        self.mem_freq = mem_freq
-        self.top_k = top_k
-        self.max_cache_size = max_cache_size
 
     def forward(
         self,
@@ -282,6 +278,9 @@ class LlamaAttention(nn.Module):
         is_mem: Optional[torch.Tensor] = None,
         last_section_mask: Optional[torch.Tensor] = None,
         offload_cache_to_cpu: bool = False,
+        use_flash: bool = False,
+        cache_top_k: Optional[int] = None,
+        mem_freq: Optional[int] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -302,13 +301,14 @@ class LlamaAttention(nn.Module):
         attn_prefix = None
         if past_key_value is not None:
             # reuse k, v, self_attention
-            if self.mem_freq is None:
+            if mem_freq is None:
                 cache_len = past_key_value[0].shape[2]
-                if self.max_cache_size is not None:
-                    cache_len = min(cache_len, self.max_cache_size)
                 if is_mem is not None:
-                    is_mem = torch.cat((is_mem.new_zeros((1, 1, q_len, cache_len)), is_mem), dim=-1)
-                    last_section_mask = torch.cat((last_section_mask.new_ones((1, 1, q_len, cache_len)), last_section_mask), dim=-1)
+                    if use_flash:
+                        is_mem = torch.cat((is_mem.new_zeros((1, cache_len)), is_mem), dim=-1)
+                    else:
+                        is_mem = torch.cat((is_mem.new_zeros((1, 1, q_len, cache_len)), is_mem), dim=-1)
+                        last_section_mask = torch.cat((last_section_mask.new_ones((1, 1, q_len, cache_len)), last_section_mask), dim=-1)
 
                 past_key_states = torch.cat([past_key_value[0], key_states], dim=2)
                 past_value_states = torch.cat([past_key_value[1], value_states], dim=2)
@@ -318,7 +318,7 @@ class LlamaAttention(nn.Module):
             else:
                 orig_value_states = value_states
 
-                incomplete_len = past_key_value[0].shape[2] % (self.mem_freq + 1)
+                incomplete_len = past_key_value[0].shape[2] % (mem_freq + 1)
                 full_len = past_key_value[0].shape[2] - incomplete_len
                 past_key_mem, past_key_incomplete = torch.split(past_key_value[0], (full_len, incomplete_len), dim=2)
                 past_value_mem, past_value_incomplete = torch.split(past_key_value[1], (full_len, incomplete_len), dim=2)
@@ -327,9 +327,12 @@ class LlamaAttention(nn.Module):
                     past_key_value = (past_key_incomplete, past_value_incomplete, *past_key_value[2:])
                 
                 if incomplete_len > 0:
-                    assert q_len + incomplete_len <= (self.mem_freq + 1)
-                is_mem = torch.cat((is_mem.new_zeros((1, 1, q_len, incomplete_len)), is_mem), dim=-1)
-                last_section_mask = torch.cat((last_section_mask.new_ones((1, 1, q_len, incomplete_len)), last_section_mask), dim=-1)
+                    assert q_len + incomplete_len <= (mem_freq + 1)
+                if use_flash:
+                    is_mem = torch.cat((is_mem.new_zeros((1, incomplete_len)), is_mem), dim=-1)
+                else:
+                    is_mem = torch.cat((is_mem.new_zeros((1, 1, q_len, incomplete_len)), is_mem), dim=-1)
+                    last_section_mask = torch.cat((last_section_mask.new_ones((1, 1, q_len, incomplete_len)), last_section_mask), dim=-1)
 
                 if len(past_key_value) > 2:
                     full_len += past_key_value[3].shape[2] * past_key_value[3].shape[3]
@@ -338,28 +341,28 @@ class LlamaAttention(nn.Module):
                 key_states = torch.cat((past_key_incomplete, key_states), dim=2)
                 value_states = torch.cat((past_value_incomplete, value_states), dim=2)
 
-                past_key_mem = past_key_mem.view(bsz, self.num_heads, -1, self.mem_freq + 1, self.head_dim)
-                past_value_mem = past_value_mem.view(bsz, self.num_heads, -1, self.mem_freq + 1, self.head_dim)
+                past_key_mem = past_key_mem.view(bsz, self.num_heads, -1, mem_freq + 1, self.head_dim)
+                past_value_mem = past_value_mem.view(bsz, self.num_heads, -1, mem_freq + 1, self.head_dim)
 
                 if len(past_key_value) > 2:
                     mem_key_nopos = torch.cat((
                         past_key_value[2], 
-                        past_key_mem.select(dim=3, index=self.mem_freq)), dim=2)
+                        past_key_mem.select(dim=3, index=mem_freq)), dim=2)
                     past_key_mem_offload = past_key_value[3]
                     past_key_mem = torch.cat((
                         past_key_mem_offload, 
                         past_key_mem.to(past_key_mem_offload.device)), dim=2)
                     past_value_mem = torch.cat((past_key_value[4], past_value_mem.to(past_key_mem_offload.device)), dim=2)
                 else:
-                    mem_key_nopos = past_key_mem.select(dim=3, index=self.mem_freq)    
+                    mem_key_nopos = past_key_mem.select(dim=3, index=mem_freq)    
                 
                 num_mems = past_key_mem.shape[2]
-                top_k = min(self.top_k, num_mems)
-                prefix_len = full_len - (top_k + 1) * (self.mem_freq + 1)
+                top_k = min(cache_top_k, num_mems)
+                prefix_len = full_len - (top_k + 1) * (mem_freq + 1)
                 mem_indices = torch.cat(
                     (position_ids.new_zeros((max(0, num_mems - top_k), )),
                     torch.arange(1, top_k + 1, device=query_states.device, dtype=position_ids.dtype)), dim=0)
-                mem_pos = (mem_indices * (self.mem_freq + 1) + self.mem_freq).unsqueeze(0).expand(bsz, -1) + prefix_len
+                mem_pos = (mem_indices * (mem_freq + 1) + mem_freq).unsqueeze(0).expand(bsz, -1) + prefix_len
                 _, mem_key = apply_rotary_pos_emb(None, mem_key_nopos, cos, sin, mem_pos)
                 mem_attn_weights = torch.matmul(query_states, mem_key.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -370,7 +373,7 @@ class LlamaAttention(nn.Module):
                 if aggregate == "max_over_tokens":
                     token_retrievers = 1
                     head_retrievers = self.num_heads
-                    mem_attn_weights = torch.nn.functional.softmax(mem_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                    mem_attn_weights = torch.nn.functional.softmax(mem_attn_weights, dim=-1,dtype=torch.float32).to(query_states.dtype)
                     mem_attn_weights = mem_attn_weights.amax(dim=2, keepdim=True)
                 elif aggregate is None:
                     token_retrievers = q_len
@@ -380,29 +383,43 @@ class LlamaAttention(nn.Module):
 
                 mem_selected_idx = mem_attn_weights.topk(dim=-1,k=top_k)[1].sort(dim=-1)[0].view(bsz, head_retrievers, token_retrievers, top_k)
                 
-                selected_indices = torch.arange(0, top_k * (self.mem_freq + 1), device=query_states.device, dtype=position_ids.dtype)
-                selected_indices = torch.where(mem_selected_idx >= num_mems - top_k, self.mem_freq + 1, 0).unsqueeze(-1) + selected_indices.view(1, 1, 1, top_k, self.mem_freq + 1)
-                selected_indices = selected_indices.view(bsz, head_retrievers, token_retrievers, -1).expand(bsz, self.num_heads, q_len, -1) + prefix_len
+                selected_indices = torch.arange(0, top_k * (mem_freq + 1), device=query_states.device, dtype=position_ids.dtype)
+                selected_indices = torch.where(mem_selected_idx >= num_mems - top_k, mem_freq + 1, 0).unsqueeze(-1) + selected_indices.view(1, 1, 1, top_k, mem_freq + 1)
+                selected_indices = selected_indices.view(bsz, head_retrievers, token_retrievers, -1) + prefix_len
 
                 
                 
                 
                 mem_selected_idx = mem_selected_idx.to(past_key_mem.device)
                 
-                mem_selected_idx = mem_selected_idx.view(bsz, self.num_heads, token_retrievers, top_k, 1, 1).expand(bsz, self.num_heads, token_retrievers, top_k, self.mem_freq + 1, self.head_dim) 
-                selected_keys = past_key_mem.unsqueeze(2).expand(bsz, self.num_heads, token_retrievers, -1, self.mem_freq + 1, self.head_dim)
+                mem_selected_idx = mem_selected_idx.view(bsz, self.num_heads, token_retrievers, top_k, 1, 1).expand(bsz, self.num_heads, token_retrievers, top_k, mem_freq + 1, self.head_dim) 
+                selected_keys = past_key_mem.unsqueeze(2).expand(bsz, self.num_heads, token_retrievers, -1, mem_freq + 1, self.head_dim)
                 selected_keys = selected_keys.take_along_dim(mem_selected_idx, dim=3).to(query_states.device)
-                selected_values = past_value_mem.unsqueeze(2).expand(bsz, self.num_heads, token_retrievers, -1, self.mem_freq + 1, self.head_dim).take_along_dim(mem_selected_idx, dim=3).to(query_states.device)
-            
-                selected_keys = selected_keys.view(bsz, self.num_heads, token_retrievers, -1, self.head_dim).expand(bsz, self.num_heads, q_len, -1, self.head_dim)
-                selected_keys = apply_rotary_pos_emb(None, selected_keys.unsqueeze(1), cos, sin, selected_indices)[1].squeeze(1)    
-                selected_values = selected_values.view(bsz, self.num_heads, token_retrievers, -1, self.head_dim).expand(bsz, self.num_heads, q_len, -1, self.head_dim)
-                attn_prefix = torch.matmul(query_states.unsqueeze(3), selected_keys.transpose(3, 4)).squeeze(3) / math.sqrt(self.head_dim)
-                is_mem_prefix = torch.cat((is_mem.new_zeros((self.mem_freq, )), is_mem.new_ones((1, )))).unsqueeze(0).repeat((top_k, 1))
-                is_mem_prefix = is_mem_prefix.view(1, 1, 1, -1).expand(1, 1, q_len, -1)
+                selected_values = past_value_mem.unsqueeze(2).expand(bsz, self.num_heads, token_retrievers, -1, mem_freq + 1, self.head_dim).take_along_dim(mem_selected_idx, dim=3).to(query_states.device)
+
+                if aggregate == "max_over_tokens":
+                    selected_indices = selected_indices.squeeze(2)
+                    selected_keys = selected_keys.view(bsz, self.num_heads, -1, self.head_dim)
+                    selected_keys = apply_rotary_pos_emb(None, selected_keys, cos, sin, selected_indices)[1] 
+                    key_states = torch.cat((selected_keys, key_states), dim=2)
+                    value_states = torch.cat((selected_values.view(bsz, self.num_heads, -1, self.head_dim), value_states), dim=2)
+                    expected_att_size = (bsz, self.num_heads, q_len, key_states.shape[2])
+                else:
+                    selected_indices = selected_indices.expand(bsz, self.num_heads, q_len, -1)
+                    selected_keys = selected_keys.view(bsz, self.num_heads, token_retrievers, -1, self.head_dim).expand(bsz, self.num_heads, q_len, -1, self.head_dim)
+                    selected_keys = apply_rotary_pos_emb(None, selected_keys, cos, sin, selected_indices)[1]
+                    selected_values = selected_values.view(bsz, self.num_heads, token_retrievers, -1, self.head_dim).expand(bsz, self.num_heads, q_len, -1, self.head_dim)
+                    attn_prefix = torch.matmul(query_states.unsqueeze(3), selected_keys.transpose(3, 4)).squeeze(3) / math.sqrt(self.head_dim)
+                    expected_att_size = (bsz, self.num_heads, q_len, q_len + incomplete_len)
+                
+                is_mem_prefix = torch.cat((is_mem.new_zeros((mem_freq, )), is_mem.new_ones((1, )))).unsqueeze(0).repeat((top_k, 1))
+                if use_flash:
+                    is_mem_prefix = is_mem_prefix.view(1, -1)
+                else:
+                    is_mem_prefix = is_mem_prefix.view(1, 1, 1, -1).expand(1, 1, q_len, -1)
+                    last_section_mask = torch.cat((last_section_mask.new_zeros((1, 1, q_len, top_k * (mem_freq + 1))), last_section_mask), dim=-1)
                 is_mem = torch.cat((is_mem_prefix, is_mem), dim=-1)
-                last_section_mask = torch.cat((last_section_mask.new_zeros((1, 1, q_len, top_k * (self.mem_freq + 1))), last_section_mask), dim=-1)
-                expected_att_size = (bsz, self.num_heads, q_len, q_len + incomplete_len)
+
 
                 past_key_states = torch.cat([past_key_value[0], key_states_before_pos], dim=2)
                 past_value_states = torch.cat([past_key_value[1], orig_value_states], dim=2)
@@ -413,7 +430,7 @@ class LlamaAttention(nn.Module):
                     past_key_value = (past_key_states, past_value_states) if use_cache else None
 
         else:
-            if self.mem_freq is None:
+            if mem_freq is None:
                 past_key_states = key_states
             else:
                 past_key_states = key_states_before_pos
@@ -421,34 +438,43 @@ class LlamaAttention(nn.Module):
             expected_att_size = (bsz, self.num_heads, q_len, kv_seq_len)
             past_key_value = (past_key_states, past_value_states) if use_cache else None
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if attn_weights.size() != expected_att_size:
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask[...,-attn_weights.shape[-1]:]
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
-        if attn_prefix is not None:
-            attn_weights = torch.cat((attn_prefix, attn_weights), dim=-1)
-        # upcast attention to fp32
-        if is_mem is None:
-            raise ValueError("Don't use this without landmarks")
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        if use_flash:
+            assert attn_prefix is None
+            assert not output_attentions
+            assert mem_freq is not None
+            attn_output = fused_landmark_attention(query_states, key_states, value_states, is_mem, block_size=mem_freq+1)
+            attn_weights = None
         else:
-            attn_weights = landmark_grouped_softmax(attn_weights, dim=-1, is_mem=is_mem.expand(-1, self.num_heads, -1, -1), last_section_mask=last_section_mask).to(query_states.dtype)
-        if attn_prefix is not None:
-            attn_prefix, attn_weights = torch.split(attn_weights, (attn_prefix.shape[-1], attn_weights.shape[-1] - attn_prefix.shape[-1]), dim=-1)
-        attn_output = torch.matmul(attn_weights, value_states)
-        if attn_prefix is not None:
-            attn_output += torch.matmul(attn_prefix.unsqueeze(3), selected_values).squeeze(3)
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if attn_weights.size() != expected_att_size:
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
 
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    )
+                attn_weights = attn_weights + attention_mask[...,-attn_weights.shape[-1]:]
+                attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+            if attn_prefix is not None:
+                attn_weights = torch.cat((attn_prefix, attn_weights), dim=-1)
+            # upcast attention to fp32
+            if is_mem is None:
+                raise ValueError("Don't use this without landmarks")
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            else:
+                attn_weights = landmark_grouped_softmax(attn_weights, dim=-1, is_mem=is_mem.expand(-1, self.num_heads, -1, -1), last_section_mask=last_section_mask).to(query_states.dtype)
+            if attn_prefix is not None:
+                attn_prefix, attn_weights = torch.split(attn_weights, (attn_prefix.shape[-1], attn_weights.shape[-1] - attn_prefix.shape[-1]), dim=-1)
+            attn_output = torch.matmul(attn_weights, value_states)
+            if attn_prefix is not None:
+                attn_output += torch.matmul(attn_prefix.unsqueeze(3), selected_values).squeeze(3)
+
+            if not output_attentions:
+                attn_weights = None
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -457,17 +483,13 @@ class LlamaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
         attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
 
         return attn_output, attn_weights, past_key_value
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaLandmarkConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
@@ -478,9 +500,6 @@ class LlamaDecoderLayer(nn.Module):
         )
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def set_mem_cache_args(self, mem_freq, top_k, max_cache_size):
-        self.self_attn.set_mem_cache_args(mem_freq, top_k, max_cache_size)
     
     def forward(
         self,
@@ -492,7 +511,10 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         is_mem: Optional[torch.Tensor] = None,
         last_section_mask: Optional[torch.Tensor] = None,
-        offload_cache_to_cpu: bool = False
+        offload_cache_to_cpu: bool = False,
+        use_flash: bool = False,
+        cache_top_k: Optional[int] = None,
+        mem_freq: Optional[int] = None
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -522,7 +544,10 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             is_mem=is_mem,
             last_section_mask=last_section_mask,
-            offload_cache_to_cpu=offload_cache_to_cpu
+            offload_cache_to_cpu=offload_cache_to_cpu,
+            use_flash=use_flash,
+            cache_top_k=cache_top_k,
+            mem_freq=mem_freq
         )
         hidden_states = residual + hidden_states
 
@@ -553,7 +578,7 @@ LLAMA_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`LlamaConfig`]):
+        config ([`LlamaLandmarkConfig`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -565,7 +590,7 @@ LLAMA_START_DOCSTRING = r"""
     LLAMA_START_DOCSTRING,
 )
 class LlamaPreTrainedModel(PreTrainedModel):
-    config_class = LlamaConfig
+    config_class = LlamaLandmarkConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["LlamaDecoderLayer"]
@@ -660,10 +685,10 @@ class LlamaModel(LlamaPreTrainedModel):
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
     Args:
-        config: LlamaConfig
+        config: LlamaLandmarkConfig
     """
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaLandmarkConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -671,8 +696,6 @@ class LlamaModel(LlamaPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.mem_id = None
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -683,13 +706,6 @@ class LlamaModel(LlamaPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
-
-    def set_mem_id(self, mem_id):
-        self.mem_id = mem_id
-
-    def set_mem_cache_args(self, mem_freq, top_k, max_cache_size):
-        for l in self.layers:
-            l.set_mem_cache_args(mem_freq, top_k, max_cache_size)
 
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
@@ -728,6 +744,9 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         offload_cache_to_cpu: Optional[bool] = None,
+        use_flash: Optional[bool] = None,
+        cache_top_k: Optional[int] = None,
+        mem_freq: Optional[int] = None
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -743,12 +762,12 @@ class LlamaModel(LlamaPreTrainedModel):
             raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape
-            if self.mem_id is not None:
+            if self.config.mem_id is not None:
                 with torch.no_grad():
-                    is_mem = input_ids == self.mem_id
+                    is_mem = input_ids == self.config.mem_id
         elif inputs_embeds is not None:
             batch_size, seq_length, _ = inputs_embeds.shape
-            if self.mem_id is not None:
+            if self.config.mem_id is not None:
                 raise NotImplementedError
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
@@ -786,7 +805,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         
         last_section_mask = None
-        if is_mem is not None:
+        if is_mem is not None and not use_flash:
             is_mem = is_mem.unsqueeze(1).unsqueeze(2)
             current_len = input_ids.shape[1]
             mem_ids = torch.where(attention_mask[..., -current_len:] < -1, 0, torch.cumsum(is_mem, -1) - is_mem.int())
@@ -832,7 +851,11 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_ids,
                     None,
                     is_mem,
-                    last_section_mask
+                    last_section_mask,
+                    offload_cache_to_cpu,
+                    use_flash,
+                    cache_top_k,
+                    mem_freq
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -844,7 +867,10 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     is_mem=is_mem,
                     last_section_mask=last_section_mask,
-                    offload_cache_to_cpu=offload_cache_to_cpu
+                    offload_cache_to_cpu=offload_cache_to_cpu,
+                    use_flash=use_flash,
+                    cache_top_k=cache_top_k,
+                    mem_freq=mem_freq,
                 )
 
             hidden_states = layer_outputs[0]
@@ -879,10 +905,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        self.mem_id = None
-        self.mem_freq = None
-        self.top_k = None
-        self.max_seq_len = None
+        self.auto_insert_landmarks = False
+        self.always_use_flash = False
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -920,6 +944,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         offload_cache_to_cpu: Optional[bool] = None,
+        use_flash: Optional[bool] = None,
+        cache_top_k: Optional[int] = None,
+        max_chunk_length: Optional[int] = 0,
+        mem_freq: Optional[int] = None,
+        drop_last_logit_if_mem: Optional[bool] = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -947,14 +976,39 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
         ```"""
 
+        use_flash = use_flash if use_flash is not None else self.always_use_flash
+
+        if self.auto_insert_landmarks:
+            mem_freq = self.config.mem_freq
+            assert self.config.mem_freq is not None
+            block_size = self.config.mem_freq + 1
+            input_ids = input_ids.view(input_ids.shape[0], -1, block_size - 1)
+            input_ids = torch.cat((input_ids, input_ids.new_full((input_ids.shape[0], input_ids.shape[1], 1), self.config.mem_id)), dim=-1)
+            input_ids = input_ids.view(input_ids.shape[0], -1)
+            if attention_mask is not None:
+                attention_mask = attention_mask.view(attention_mask.shape[0], -1, block_size - 1)
+                attention_mask = torch.cat((attention_mask, attention_mask.new_ones((attention_mask.shape[0], attention_mask.shape[1], 1))), dim=-1)
+                attention_mask = attention_mask.view(attention_mask.shape[0], -1)
+
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        if max_chunk_length == 0:
+            if cache_top_k is not None:
+                max_chunk_length = self.config.train_context_length - self.config.train_context_length % (mem_freq + 1) - (cache_top_k + 1) * (mem_freq + 1)
+                if max_chunk_length <= 0:
+                    raise ValueError("K is too large for this model.")
+            else:
+                max_chunk_length = None
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        window_len = self.max_seq_len or input_ids.shape[1]
+        window_len = max_chunk_length or input_ids.shape[1]
+        if use_flash:
+            assert window_len % (mem_freq + 1) == 0
         last_logits = None
         for step, idx in enumerate(range(0, input_ids.shape[1], window_len)):
             if idx >= 1:
@@ -973,6 +1027,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
                 offload_cache_to_cpu=offload_cache_to_cpu,
+                use_flash=(use_flash or self.auto_insert_landmarks),
+                cache_top_k=cache_top_k,
+                mem_freq=mem_freq,
             )
             past_key_values = outputs[1]
             if last_logits is not None:
@@ -980,6 +1037,17 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             last_logits = outputs[0]
 
         hidden_states = last_logits
+        if self.auto_insert_landmarks:
+            block_size = self.config.mem_freq + 1
+            hidden_states = hidden_states.reshape(hidden_states.shape[0], hidden_states.shape[1] // block_size, block_size, hidden_states.shape[2])
+            hidden_states = hidden_states[:, :, :block_size - 1]
+            hidden_states = hidden_states.reshape(hidden_states.shape[0], -1, hidden_states.shape[3])
+        if drop_last_logit_if_mem:
+            is_any_mem = (input_ids[:, -1] == self.config.mem_id).any()
+            are_all_mem = (input_ids[:, -1] == self.config.mem_id).all()
+            assert is_any_mem == are_all_mem
+            if is_any_mem:
+                hidden_states = hidden_states[:, :-1]
         logits = self.lm_head(hidden_states)
 
         loss = None
@@ -1008,16 +1076,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
 
     def set_mem_id(self, mem_id):
-        self.mem_id = mem_id
-        self.model.set_mem_id(mem_id)
-    
-    def set_mem_cache_args(self, max_seq_len, mem_freq, top_k, max_cache_size):
-        self.mem_freq = mem_freq
-        self.top_k = top_k
-        self.max_seq_len = max_seq_len
-        if self.max_seq_len is not None:
-            assert self.max_seq_len % (self.mem_freq + 1) == 0
-        self.model.set_mem_cache_args(mem_freq, top_k, max_cache_size)
+        if self.config.mem_id is not None:
+            assert mem_id == self.config.mem_id, "Chanigng mem_id can break the model. If you really intend to do this, manually disable this check"
+        self.config.mem_id = mem_id
+
+    def enable_landmark_insertion(self):
+        self.auto_insert_landmarks = True
+
+    def enable_flash(self):
+        self.always_use_flash = True
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
@@ -1025,36 +1092,40 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         total_len = input_ids.shape[1]
         if past_key_values:
             prev_len = input_ids.shape[1] - 1
+            use_flash = False if kwargs.get("use_flash") is not None else None
         else:
             prev_len = 0
+            use_flash = kwargs.get("use_flash")
 
         position_ids = kwargs.get("position_ids", None)
 
-        if self.mem_freq is not None:
+        mem_freq = kwargs.get("mem_freq") or self.config.mem_freq
+
+        if mem_freq is not None:
             if position_ids is not None:
                 raise NotImplementedError
             T = input_ids.shape[1]
 
-            prev_incomplete_len = prev_len % self.mem_freq
+            prev_incomplete_len = prev_len % mem_freq
             prev_complete_len = prev_len - prev_incomplete_len
-            incomplete_len = total_len % self.mem_freq
+            incomplete_len = total_len % mem_freq
             new_full_len = total_len - prev_complete_len - incomplete_len
 
             prev_input, input_ids_with_mem, input_ids_without_mem = torch.split(input_ids, (prev_complete_len, new_full_len, incomplete_len), dim=-1)
             
             bsz, q_len = input_ids.size()
-            input_ids_with_mem = input_ids_with_mem.view(bsz, -1, self.mem_freq)            
+            input_ids_with_mem = input_ids_with_mem.view(bsz, -1, mem_freq)            
             input_ids_with_mem = torch.cat(
                 (
                     input_ids_with_mem, 
-                    input_ids_with_mem.new_full((bsz, input_ids_with_mem.shape[1], 1), self.mem_id)
+                    input_ids_with_mem.new_full((bsz, input_ids_with_mem.shape[1], 1), self.config.mem_id)
                 ), 
                 dim=-1
             ).view(bsz, -1)
             input_ids = torch.cat((prev_input, input_ids_with_mem, input_ids_without_mem), dim=-1)
             if attention_mask is not None:
                 attention_mask_with_mem, attention_mask_without_mem = torch.split(attention_mask, (prev_complete_len + new_full_len, incomplete_len), dim=-1)
-                attention_mask_with_mem = attention_mask_with_mem.view(bsz, -1, self.mem_freq)
+                attention_mask_with_mem = attention_mask_with_mem.view(bsz, -1, mem_freq)
                 attention_mask_with_mem = torch.cat(
                     (
                         attention_mask_with_mem, 
@@ -1073,7 +1144,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             position_ids = position_ids[:, -input_ids.shape[1]:].unsqueeze(-1)
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None and self.mem_freq is None:
+        if inputs_embeds is not None and past_key_values is None and mem_freq is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}
@@ -1084,7 +1155,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
-                "offload_cache_to_cpu": kwargs.get("offload_cache_to_cpu")
+                "offload_cache_to_cpu": kwargs.get("offload_cache_to_cpu"),
+                "use_flash": use_flash,
+                "cache_top_k": kwargs.get("cache_top_k"),
+                "max_chunk_length": kwargs.get("max_chunk_length", 0),
+                "mem_freq": mem_freq,
+                "drop_last_logit_if_mem": True,
             }
         )
         return model_inputs
