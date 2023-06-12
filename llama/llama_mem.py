@@ -370,7 +370,7 @@ class LlamaAttention(nn.Module):
                 if aggregate == "max_over_tokens":
                     token_retrievers = 1
                     head_retrievers = self.num_heads
-                    mem_attn_weights = torch.nn.functional.softmax(mem_attn_weights, dim=-1)
+                    mem_attn_weights = torch.nn.functional.softmax(mem_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
                     mem_attn_weights = mem_attn_weights.amax(dim=2, keepdim=True)
                 elif aggregate is None:
                     token_retrievers = q_len
