@@ -107,6 +107,18 @@ def tokenize_fn(tokenizer, example):
     )
     return {"input_ids": outputs["input_ids"].view(-1, context_length)}
 
+def add_mem_tokens(example, mem_freq, mem_id):
+    x = example["input_ids"]
+    ret = []
+    prev_idx = 0
+    for t_idx in range(mem_freq, len(x), mem_freq):
+        ret.extend(x[prev_idx:t_idx])
+        ret.append(mem_id)
+        prev_idx = t_idx
+    ret.extend(x[prev_idx:])
+    # drop attention_mask
+    return {"input_ids": ret}
+
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, TrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses()
