@@ -1160,7 +1160,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 "cache_top_k": kwargs.get("cache_top_k"),
                 "max_chunk_length": kwargs.get("max_chunk_length", 0),
                 "mem_freq": mem_freq,
-                "drop_last_logit_if_mem": True,
+                "drop_last_logit_if_mem": not self.config.include_landmark_in_loss,
             }
         )
         return model_inputs

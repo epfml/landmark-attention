@@ -127,6 +127,7 @@ def train():
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         mem_freq=training_args.mem_freq,
+        include_landmark_in_loss=not training_args.use_flash
     )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
