@@ -4,7 +4,7 @@ This repository contains the implementation of landmark attention as described i
 
 **Landmark Attention: Random-Access Infinite Context Length for Transformers**<br>
 Amirkeivan Mohtashami, Martin Jaggi<br>
-Preprint: https://arxiv.org/abs/2305.16300
+NeurIPS 2023: https://arxiv.org/abs/2305.16300
 
 ## Repository Structure
 
